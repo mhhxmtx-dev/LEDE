@@ -1,0 +1,118 @@
+name: Build OpenWrt
+
+on:
+  workflow_dispatch:   # 手动触发
+  push:
+    branches:
+      - main           # 你fork仓库的分支名（一般是main或者master）
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Update feeds
+      run: |
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Configure OpenWrt
+      run: |
+        rm -f .config
+        # 这里写你的配置，默认加上 passwall2
+        cat >> .config <<EOF
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_PACKAGE_luci-app-passwall2=y
+        CONFIG_PACKAGE_luci-app-adblock=y
+        CONFIG_PACKAGE_https-dns-proxy=y
+        EOF
+        make defconfig
+
+    - name: Add custom files
+      run: |
+        mkdir -p files/etc/uci-defaults
+        cat > files/etc/uci-defaults/99-custom-settings <<'EOF'
+        #!/bin/sh
+
+        ### ===============================
+        ### 基础设置：远程管理
+        ### ===============================
+
+        passwd -d root
+        uci set dropbear.@dropbear[0].Port='22'
+        uci set dropbear.@dropbear[0].PasswordAuth='on'
+        uci commit dropbear
+        uci set uhttpd.main.listen_http=''
+        uci set uhttpd.main.listen_https='0.0.0.0:443'
+        uci commit uhttpd
+        /etc/init.d/uhttpd disable
+        /etc/init.d/nginx enable
+        uci set firewall.@zone[1].input='REJECT'
+        uci commit firewall
+
+        ### ===============================
+        ### Passwall2 默认配置：多节点
+        ### ===============================
+
+        uci set passwall2.@global[0].enabled='1'
+        uci set passwall2.@global[0].china_dns='default'
+        uci set passwall2.@global[0].proxy_mode='chnroute'
+
+        # 节点 1: VLESS
+        uci add passwall2 nodes
+        uci set passwall2.@nodes[-1].type='Xray'
+        uci set passwall2.@nodes[-1].protocol='vless'
+        uci set passwall2.@nodes[-1].address='1.2.3.4'
+        uci set passwall2.@nodes[-1].port='443'
+        uci set passwall2.@nodes[-1].uuid='xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+        uci set passwall2.@nodes[-1].tls='1'
+        uci set passwall2.@nodes[-1].transport='tcp'
+
+        # 节点 2: SSR
+        uci add passwall2 nodes
+        uci set passwall2.@nodes[-1].type='SSR'
+        uci set passwall2.@nodes[-1].address='5.6.7.8'
+        uci set passwall2.@nodes[-1].port='8388'
+        uci set passwall2.@nodes[-1].password='yourpassword'
+        uci set passwall2.@nodes[-1].method='aes-256-cfb'
+        uci set passwall2.@nodes[-1].protocol='origin'
+        uci set passwall2.@nodes[-1].obfs='plain'
+
+        # 默认主节点 = 节点 1
+        uci set passwall2.@global[0].tcp_node='1'
+        uci set passwall2.@global[0].udp_node='1'
+
+        # 自动故障切换
+        uci set passwall2.@auto_switch[0].enable='1'
+        uci set passwall2.@auto_switch[0].tcp_check='1'
+        uci set passwall2.@auto_switch[0].testing_time='60'
+        uci add_list passwall2.@auto_switch[0].node='1'
+        uci add_list passwall2.@auto_switch[0].node='2'
+
+        ### ===============================
+        ### Adblock + DoH
+        ### ===============================
+        uci set adblock.global.enabled='1'
+        uci commit adblock
+
+        uci set https-dns-proxy.@https-dns-proxy[0].enabled='1'
+        uci set https-dns-proxy.@https-dns-proxy[0].resolver_url='https://dns.google/dns-query'
+        uci commit https-dns-proxy
+
+        exit 0
+        EOF
+        chmod +x files/etc/uci-defaults/99-custom-settings
+
+    - name: Build OpenWrt
+      run: |
+        make -j$(nproc) || make -j1 V=s
+
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: openwrt-firmware
+        path: bin/targets/*/*
